@@ -1,0 +1,16 @@
+{
+  "api": ["python3"],
+  "author": "434b",
+  "description": "Instruction assembler",
+  "license": {
+    "name": "Apache 2.0",
+    "text": "Copyright 2024 0x434b <admin@0x434b.dev>"
+  },
+  "longdescription": "",
+  "minimumbinaryninjaversion": 4526,
+  "name": "Shellcoder",
+  "platforms": ["Darwin", "Linux", "Windows"],
+  "pluginmetadataversion": 2,
+  "type": ["helper"],
+  "version": "1.0.0"
+}
