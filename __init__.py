@@ -32,8 +32,8 @@ class DisassemblerError(Exception):
 
 
 class Assembler:
-    def __init__(self):
-        self.arch = None
+    def __init__(self) -> None:
+        self.arch: Architecture = None
 
     def set_architecture(self, arch_name: str) -> None:
         try:
@@ -98,7 +98,7 @@ class Assembler:
         assembled_instructions: List[Dict],
         output_format: str,
         total_bytes: int,
-        mnemonic_options: Dict = None,
+        mnemonic_options: Dict = {},
     ) -> str:
         if total_bytes == 0:
             return "No instructions to assemble"
@@ -133,7 +133,7 @@ class Assembler:
                 else:
                     lines.append(f'    b"{instr["bytes"].hex()}",  # {instr["asm"]}')
             return (
-                f"shellcode = [\n"
+                "shellcode = [\n"
                 + "\n".join(lines)
                 + f"\n]\n\n# Total length: {total_bytes} bytes\n"
                 f"shellcode_length = {total_bytes}\n"
@@ -151,7 +151,7 @@ class Assembler:
                     hex_bytes = [f"0x{b:02x}" for b in instr["bytes"]]
                     lines.append(f"    {', '.join(hex_bytes)},  // {instr['asm']}")
             return (
-                f"unsigned char shellcode[] = {{\n"
+                "unsigned char shellcode[] = {{\n"
                 + "\n".join(lines)
                 + f"\n}};\n\n// Total length: {total_bytes} bytes\n"
                 f"const size_t shellcode_length = {total_bytes};"
@@ -563,6 +563,8 @@ class AssemblerWidget(QWidget):
         highlight_format = QTextCharFormat()
         highlight_format.setBackground(QColor(255, 200, 200))  # Light red background
         highlight_format.setForeground(QColor(0, 0, 0))  # Black text
+        start = 0
+        length = 0
 
         for result in found_bad_patterns:
             offset, pattern = result["offset"], result["pattern"]
@@ -592,6 +594,10 @@ class AssemblerWidget(QWidget):
                 start = offset * 3
                 length = pattern_length * 3 - 1
 
+            if not start:
+                self.show_error("Could not find the start position for highlighting")
+            if not length:
+                self.show_error("Could not find the length for highlighting")
             cursor.setPosition(start)
             cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, length)
             cursor.mergeCharFormat(highlight_format)
