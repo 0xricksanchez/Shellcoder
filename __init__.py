@@ -619,6 +619,6 @@ def run_plugin(bv) -> None:
     assembler_widget.show()
 
 
-UIAction.registerAction("Shellcoder\\Assemble")
+UIAction.registerAction("Shellcoder\\Run")
 UIActionHandler.globalActions().bindAction("Shellcoder\\Run", UIAction(run_plugin))
 Menu.mainMenu("Plugins").addAction("Shellcoder\\Run", "Shellcoder")
