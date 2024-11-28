@@ -1,5 +1,5 @@
 from binaryninja import Architecture, BinaryView
-from binaryninjaui import UIAction, UIActionHandler, Menu
+from binaryninjaui import UIAction, UIActionHandler, Menu, UIContext
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -226,6 +226,13 @@ class Assembler:
 class AssemblerWidget(QWidget):
     def __init__(self, parent=None):
         super(AssemblerWidget, self).__init__(parent)
+
+        # To get a binaryview we can use the UIContext of the currently opened file/db
+        view = UIContext.activeContext().getCurrentView()
+        # Get the actual BinaryView from the UI view
+        self.bv = view.getData() if view else None
+        # Now we can access the architecture
+        self._current_arch = self.bv.arch if self.bv else None
         self.assembler = Assembler()
         self.initUI()
 
@@ -238,6 +245,8 @@ class AssemblerWidget(QWidget):
         self.arch_combo = QComboBox()
         for arch in list(Architecture):
             self.arch_combo.addItem(arch.name)
+        if self._current_arch:
+            self.arch_combo.setCurrentText(self._current_arch.name)
         arch_layout.addWidget(arch_label)
         arch_layout.addWidget(self.arch_combo)
         layout.addLayout(arch_layout)
