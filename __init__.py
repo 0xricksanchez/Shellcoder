@@ -78,7 +78,7 @@ class Assembler:
             disassembly = bv.get_disassembly(offset)
             if disassembly is None:
                 break
-            instruction_length = len(bv.read(offset, self.arch.max_instr_length))
+            instruction_length = len(bv.get_instruction_length(offset)) if hasattr(bv, 'get_instruction_length') else 4
             disassembled_instructions.append(
                 {
                     "type": "instruction",
