@@ -30,9 +30,10 @@
 
 ## Development
 
-  ```sh
-  uv run python -m unittest discover -s tests
+```sh
+uv run python -m unittest discover -s tests
+```
 
-  ## License
+## License
 
-  Apache-2.0
+[Apache-2.0](LICENSE)
