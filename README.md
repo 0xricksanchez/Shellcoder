@@ -1,80 +1,38 @@
-# BinaryNinja Shellcoder Plugin
+# Shellcoder
 
-## Overview
+  Assemble, inspect, and format shellcode without leaving Binary Ninja.
 
-Shellcoder is a lightweight plugin for Binary Ninja that enhances shellcode development and analysis.
-It provides a versatile interface for assembling, disassembling, and formatting shellcode, supporting multiple architectures and output formats akin to the online ShellStorm Assembler/Disassembler.
+  ![Shellcoder](img/interface.png)
 
-## Features
+## Use
 
-- **Multi-architecture Support**: Compatible with all architectures supported by Binary Ninja.
-- **Flexible Input Formats**:
-  - Assembly instructions
-  - Inline hex format (e.g., "\x90\x90")
-  - Space-separated hex format (e.g., 90 90)
-- **Multiple Output Formats**:
-  - Inline hex
-  - Space-separated hex
-  - Python byte string
-  - C-style array
-  - Disassembled mnemonics (for disassembling)
-- **Customizable Mnemonic Display**:
-  - Optional address display
-  - Optional bytecode display
-  - Adjustable base address for relative operations
-- **Comment usage**:
-  - You can annotate your assembly/shellcode with comments (`#`, `//`, or `;`)
-- **Bad Character Identification**: Quickly identify and highlight problematic bytes in your shellcode.
-- **No External Dependencies**: Utilizes only Binary Ninja's built-in functionalities, ensuring a lightweight and easily deployable solution.
+  Open `Plugins > Shellcoder`, then:
 
-## Installation
+- Choose `Auto`, `Assembly`, or `Hex` input.
+- Set the architecture and optional base address.
+- Select Inline, Hex, Python, C array, or mnemonic output.
+- Copy the current output, or copy a specific format directly.
 
-1. Clone this repository or download the source code.
-2. Copy the plugin file to your Binary Ninja plugins folder:
-   - Windows: `%APPDATA%\Binary Ninja\plugins\`
-   - Linux: `~/.binaryninja/plugins/`
-   - macOS: `~/Library/Application Support/Binary Ninja/plugins/`
-3. Restart Binary Ninja or reload plugins.
+## Inspect
 
-## Usage
+- Select an input line to highlight its output bytes.
+- Select output bytes to jump back to their source line.
+- Search hex with regular expressions.
+- `Respect byte boundaries` excludes partial-byte matches.
+- Check bad patterns, optionally requiring a match to stay within one decoded instruction.
+- Built-in presets cover C strings, line breaks, and whitespace.
 
-1. Open Binary Ninja and navigate to the "Plugins" menu.
-2. Select "Shellcoder" to open the plugin interface.
-3. Enter your assembly code or hex-formatted shellcode in the input area.
-4. Choose your desired output format and options.
-5. Click "Assemble" to process your input.
-6. View the results in the output area.
+## Notes
 
-_Note_: Alternatively you can use `CTRL+p` to open the command palette and search for the plugin.
+- Comments starting with `#`, `;`, or `//` are accepted.
+- Requires Binary Ninja 4526 or newer.
+- Binary Ninja provides the runtime dependencies.
 
-## Showcase
+## Development
 
-![interface](img/interface.png)
+  ```sh
+  uv run python -m unittest discover -s tests
 
-## Contributing
+  ## License
 
-Contributions to the plugin are more than welcome! Here's how you can contribute:
-
-1. Fork the repository.
-2. Create a new branch for your feature or bug fix.
-3. Commit your changes with clear, descriptive commit messages.
-4. Push your branch and submit a pull request.
-
-Please ensure your code adheres to the existing style and includes appropriate tests and documentation whenever necessary.
-
-## License
-
-This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- The Binary Ninja team for their excellent reverse engineering platform.
-- The ShellStorm online assembler/disassembler for giving me the idea.
-
-## Contact
-
-For bug reports, feature requests, or general inquiries, please open an issue on the GitHub repository.
-
----
-
-Happy shellcoding!
+  Apache-2.0

@@ -12,15 +12,26 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QCheckBox,
     QMessageBox,
+    QTabWidget,
+    QToolButton,
+    QSplitter,
 )
-from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor, QFont
-from PySide6.QtCore import QTimer
+from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor, QFontDatabase
+from PySide6.QtCore import QTimer, Qt
 
 import re
-from typing import List, Dict
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+from .workflow import ShellcodeWorkflow, find_bad_patterns, search_hex_pattern
 
 # Constants
 COMMENT_CHARS = ["#", ";", "//"]
+BAD_PATTERN_PRESETS = {
+    "C string": "00",
+    "Line breaks": "0a 0d",
+    "Whitespace": "09 0a 0d 20",
+}
 
 
 class AssemblerError(Exception):
@@ -29,6 +40,51 @@ class AssemblerError(Exception):
 
 class DisassemblerError(Exception):
     pass
+
+
+@dataclass
+class ShellcodeResult:
+    instructions: List[Dict]
+    source_lines: List[Optional[int]] = field(default_factory=list)
+
+    @property
+    def raw_bytes(self) -> bytes:
+        return b"".join(
+            instruction["bytes"]
+            for instruction in self.instructions
+            if instruction["type"] == "instruction"
+        )
+
+    @property
+    def total_bytes(self) -> int:
+        return len(self.raw_bytes)
+
+    def source_line_at_offset(self, offset: int) -> Optional[int]:
+        current_offset = 0
+        for index, instruction in enumerate(self.instructions):
+            if instruction["type"] != "instruction":
+                continue
+            instruction_end = current_offset + len(instruction["bytes"])
+            if current_offset <= offset < instruction_end:
+                if index < len(self.source_lines):
+                    return self.source_lines[index]
+                return None
+            current_offset = instruction_end
+        return None
+
+    def byte_range_for_source_line(self, source_line: int) -> Optional[tuple]:
+        current_offset = 0
+        for index, instruction in enumerate(self.instructions):
+            if instruction["type"] != "instruction":
+                continue
+            instruction_length = len(instruction["bytes"])
+            if (
+                index < len(self.source_lines)
+                and self.source_lines[index] == source_line
+            ):
+                return current_offset, instruction_length
+            current_offset += instruction_length
+        return None
 
 
 class Assembler:
@@ -41,33 +97,70 @@ class Assembler:
         except KeyError:
             raise AssemblerError(f"Unsupported architecture: {arch_name}")
 
-    def assemble(self, input_text: str) -> List[Dict]:
-        assembled_instructions = []
-        for line in input_text.split("\n"):
+    def assemble(self, input_text: str, address: int = 0) -> ShellcodeResult:
+        comments = []
+        source_lines = []
+        for line_number, line in enumerate(input_text.split("\n"), start=1):
             line = line.strip()
             if line.startswith(tuple(COMMENT_CHARS)):
-                assembled_instructions.append({"type": "comment", "content": line})
+                comments.append({"type": "comment", "content": line})
             elif line:
-                try:
-                    result = self.arch.assemble(line)
-                    assembled_instructions.append(
-                        {
-                            "type": "instruction",
-                            "asm": line,
-                            "bytes": result,
-                        }
-                    )
-                except Exception as e:
-                    raise AssemblerError(
-                        f"Could not assemble line: '{line}'. Error: {str(e)}"
-                    )
+                source_lines.append((line_number, line))
 
-        if not assembled_instructions:
+        if not source_lines:
             raise AssemblerError("No instructions were assembled")
 
-        return assembled_instructions
+        assembled_bytes = bytearray()
+        source_ranges = []
+        for index, (line_number, line) in enumerate(source_lines):
+            try:
+                if self.arch.name in ("mipsel32", "mips32"):
+                    instruction_bytes = self.arch.assemble(
+                        line, address + len(assembled_bytes)
+                    )
+                else:
+                    instruction_bytes = self.arch.assemble(line)
+            except Exception as e:
+                message = e.args[0] if e.args else str(e)
+                if isinstance(message, bytes):
+                    message = message.decode(errors="replace")
+                message = str(message).replace("\\n", "\n")
+                if message.startswith("Could not assemble: b'") and message.endswith("'"):
+                    message = message[len("Could not assemble: b'") : -1]
+                raise AssemblerError(f"Line {line_number} ({line}):\n{message}")
 
-    def disassemble(self, input_bytes: bytes) -> List[Dict]:
+            if (
+                self.arch.name in ("mipsel32", "mips32")
+                and index + 1 < len(source_lines)
+                and len(instruction_bytes) > 4
+                and instruction_bytes[-4:] == b"\x00\x00\x00\x00"
+            ):
+                instruction_bytes = instruction_bytes[:-4]
+
+            start = len(assembled_bytes)
+            assembled_bytes.extend(instruction_bytes)
+            source_ranges.append((start, len(assembled_bytes), line_number))
+
+        result = self.disassemble(bytes(assembled_bytes))
+        instruction_source_lines = []
+        offset = 0
+        for instruction in result.instructions:
+            source_line = next(
+                (
+                    line_number
+                    for start, end, line_number in source_ranges
+                    if start <= offset < end
+                ),
+                None,
+            )
+            instruction_source_lines.append(source_line)
+            offset += len(instruction["bytes"])
+        return ShellcodeResult(
+            comments + result.instructions,
+            [None] * len(comments) + instruction_source_lines,
+        )
+
+    def disassemble(self, input_bytes: bytes) -> ShellcodeResult:
         disassembled_instructions = []
         bv = BinaryView.new(data=input_bytes)
         bv.arch = self.arch
@@ -78,7 +171,7 @@ class Assembler:
             disassembly = bv.get_disassembly(offset)
             if disassembly is None:
                 break
-            instruction_length = len(bv.get_instruction_length(offset)) if hasattr(bv, 'get_instruction_length') else 4
+            instruction_length = bv.get_instruction_length(offset)
             disassembled_instructions.append(
                 {
                     "type": "instruction",
@@ -91,15 +184,17 @@ class Assembler:
         if not disassembled_instructions:
             raise DisassemblerError("No instructions were disassembled")
 
-        return disassembled_instructions
+        return ShellcodeResult(disassembled_instructions)
 
     def format_output(
         self,
-        assembled_instructions: List[Dict],
+        result: ShellcodeResult,
         output_format: str,
-        total_bytes: int,
-        mnemonic_options: Dict = {},
+        mnemonic_options: Dict = None,
     ) -> str:
+        assembled_instructions = result.instructions
+        total_bytes = result.total_bytes
+        mnemonic_options = mnemonic_options or {}
         if total_bytes == 0:
             return "No instructions to assemble"
 
@@ -160,6 +255,14 @@ class Assembler:
         elif output_format == "Mnemonics":
             lines = []
             address = mnemonic_options.get("base_address", 0) if mnemonic_options else 0
+            bytecode_width = max(
+                (
+                    len(instruction["bytes"].hex())
+                    for instruction in assembled_instructions
+                    if instruction["type"] == "instruction"
+                ),
+                default=0,
+            )
             for instr in assembled_instructions:
                 if instr["type"] == "comment":
                     lines.append(instr["content"])
@@ -168,7 +271,9 @@ class Assembler:
                     if mnemonic_options.get("show_addresses", True):
                         line_parts.append(f"{address:08x}:")
                     if mnemonic_options.get("show_bytecodes", True):
-                        line_parts.append(f"{instr['bytes'].hex():<16}")
+                        line_parts.append(
+                            f"{instr['bytes'].hex():<{bytecode_width}}"
+                        )
                     if mnemonic_options.get("show_instructions", True):
                         line_parts.append(instr["asm"])
                     lines.append("  ".join(line_parts))
@@ -181,46 +286,28 @@ class Assembler:
     def search_pattern(
         self, assembled_bytes: bytes, pattern: str, respect_boundaries: bool
     ) -> List[Dict]:
-        if respect_boundaries:
-            hex_string = " ".join(f"{b:02x}" for b in assembled_bytes)
-            byte_pattern = " ".join(
-                pattern[i : i + 2] for i in range(0, len(pattern), 2)
-            )
-            matches = list(re.finditer(byte_pattern, hex_string))
-            return [
-                {
-                    "offset": match.start() // 3,
-                    "matched": match.group().replace(" ", ""),
-                }
-                for match in matches
-            ]
-        else:
-            hex_string = assembled_bytes.hex()
-            matches = list(re.finditer(pattern, hex_string))
-            return [
-                {"offset": match.start() // 2, "matched": match.group()}
-                for match in matches
-            ]
+        return search_hex_pattern(
+            assembled_bytes.hex(), pattern, respect_boundaries
+        )
 
     def check_bad_patterns(
         self,
-        assembled_bytes: bytes,
+        result: ShellcodeResult,
         bad_patterns: List[bytes],
         respect_instructions: bool,
     ) -> List[Dict]:
-        found_bad_patterns = []
-        instruction_width = 4  # Default to 4 bytes, adjust based on architecture
+        instruction_ranges = None
+        if respect_instructions:
+            instruction_ranges = []
+            offset = 0
+            for instruction in result.instructions:
+                if instruction["type"] != "instruction":
+                    continue
+                end = offset + len(instruction["bytes"])
+                instruction_ranges.append((offset, end))
+                offset = end
 
-        for pattern in bad_patterns:
-            for i in range(len(assembled_bytes) - len(pattern) + 1):
-                if respect_instructions:
-                    instruction_start = (i // instruction_width) * instruction_width
-                    if i + len(pattern) > instruction_start + instruction_width:
-                        continue
-                if assembled_bytes[i : i + len(pattern)] == pattern:
-                    found_bad_patterns.append({"offset": i, "pattern": pattern.hex()})
-
-        return found_bad_patterns
+        return find_bad_patterns(result.raw_bytes, bad_patterns, instruction_ranges)
 
 
 class AssemblerWidget(QWidget):
@@ -234,6 +321,12 @@ class AssemblerWidget(QWidget):
         # Now we can access the architecture
         self._current_arch = self.bv.arch if self.bv else None
         self.assembler = Assembler()
+        self.workflow = ShellcodeWorkflow(self.assembler, tuple(COMMENT_CHARS))
+        self.result = None
+        self._syncing_selection = False
+        self.bad_byte_ranges = []
+        self.search_byte_ranges = []
+        self.selected_byte_ranges = []
         self.initUI()
 
     def initUI(self) -> None:
@@ -250,6 +343,17 @@ class AssemblerWidget(QWidget):
         arch_layout.addWidget(arch_label)
         arch_layout.addWidget(self.arch_combo)
         layout.addLayout(arch_layout)
+
+        input_mode_layout = QHBoxLayout()
+        input_mode_label = QLabel("Input Mode:")
+        self.input_mode_combo = QComboBox()
+        self.input_mode_combo.addItems(["Auto", "Assembly", "Hex"])
+        self.input_mode_combo.setToolTip(
+            "Auto detects hex input. Select Assembly or Hex to override detection."
+        )
+        input_mode_layout.addWidget(input_mode_label)
+        input_mode_layout.addWidget(self.input_mode_combo)
+        layout.addLayout(input_mode_layout)
 
         # Output format selection
         format_layout = QHBoxLayout()
@@ -291,38 +395,80 @@ class AssemblerWidget(QWidget):
         base_address_label = QLabel("Base Address:")
         self.base_address_input = QLineEdit()
         self.base_address_input.setText("0")
+        self.base_address_input.setToolTip(
+            "Address used for assembly and mnemonic display"
+        )
         base_address_layout.addWidget(base_address_label)
         base_address_layout.addWidget(self.base_address_input)
         self.base_address_widget.setLayout(base_address_layout)
-        self.base_address_widget.hide()
         layout.addWidget(self.base_address_widget)
 
-        # Assembly input
+        self.editor_splitter = QSplitter(Qt.Vertical)
+        self.editor_splitter.setChildrenCollapsible(False)
+
+        input_panel = QWidget()
+        input_layout = QVBoxLayout(input_panel)
         self.asm_input = QTextEdit()
         input_label = QLabel("Input:")
         self.asm_input.setPlaceholderText(
             "Enter assembly instructions (one per line), or inline/hex formatted shellcode"
         )
-        layout.addWidget(input_label)
-        layout.addWidget(self.asm_input)
+        input_layout.addWidget(input_label)
+        input_layout.addWidget(self.asm_input)
 
-        # Assemble button
         self.assemble_button = QPushButton("Run")
         self.assemble_button.clicked.connect(self.assemble)
-        layout.addWidget(self.assemble_button)
+        input_layout.addWidget(self.assemble_button)
+        input_panel.setMinimumHeight(160)
+        self.editor_splitter.addWidget(input_panel)
 
-        # Output display
+        output_panel = QWidget()
+        output_layout = QVBoxLayout(output_panel)
         self.output = QTextEdit()
         output_label = QLabel("Output:")
         self.output.setReadOnly(True)
-        self.output.setFont(QFont("Monospace"))
-        layout.addWidget(output_label)
-        layout.addWidget(self.output)
+        self.output.setFont(
+            QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        )
+        output_layout.addWidget(output_label)
+        output_layout.addWidget(self.output)
 
-        # Copy button
+        copy_layout = QHBoxLayout()
         self.copy_button = QPushButton("Copy Output")
         self.copy_button.clicked.connect(self.copy_output)
-        layout.addWidget(self.copy_button)
+        copy_layout.addWidget(self.copy_button)
+        for label, output_format in (
+            ("Copy Hex", "Hex"),
+            ("Copy Inline", "Inline"),
+            ("Copy Python", "Python"),
+            ("Copy C", "C-Array"),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(
+                lambda _, format_name=output_format: self.copy_format(format_name)
+            )
+            copy_layout.addWidget(button)
+        output_layout.addLayout(copy_layout)
+
+        highlight_legend = QHBoxLayout()
+        highlight_legend.addWidget(QLabel("Highlights:"))
+        for label, color in (
+            ("Bad pattern", "#b91c1c"),
+            ("Search", "#0f766e"),
+            ("Source selection", "#1e40af"),
+        ):
+            legend_item = QLabel(label)
+            legend_item.setStyleSheet(
+                f"background-color: {color}; color: white; padding: 2px 6px;"
+            )
+            highlight_legend.addWidget(legend_item)
+        highlight_legend.addStretch()
+        output_layout.addLayout(highlight_legend)
+        output_panel.setMinimumHeight(160)
+        self.editor_splitter.addWidget(output_panel)
+        self.editor_splitter.setStretchFactor(0, 1)
+        self.editor_splitter.setStretchFactor(1, 1)
+        layout.addWidget(self.editor_splitter, 1)
 
         # Search pattern
         search_layout = QHBoxLayout()
@@ -344,6 +490,10 @@ class AssemblerWidget(QWidget):
         # Bad characters input
         bad_chars_layout = QHBoxLayout()
         bad_chars_label = QLabel("Bad patterns:")
+        self.bad_pattern_preset = QComboBox()
+        self.bad_pattern_preset.addItem("Preset")
+        for label, value in BAD_PATTERN_PRESETS.items():
+            self.bad_pattern_preset.addItem(label, value)
         self.bad_chars_input = QLineEdit()
         self.bad_chars_input.setPlaceholderText(
             "Enter bad patterns (e.g., 00 0a 0d fffe)"
@@ -351,6 +501,7 @@ class AssemblerWidget(QWidget):
         self.bad_chars_check = QPushButton("Check Bad Patterns")
         self.bad_chars_check.clicked.connect(self.check_bad_patterns)
         bad_chars_layout.addWidget(bad_chars_label)
+        bad_chars_layout.addWidget(self.bad_pattern_preset)
         bad_chars_layout.addWidget(self.bad_chars_input)
         bad_chars_layout.addWidget(self.bad_chars_check)
         layout.addLayout(bad_chars_layout)
@@ -368,16 +519,40 @@ class AssemblerWidget(QWidget):
         length_layout.addStretch()
         layout.addLayout(length_layout)
 
-        # Search results display
+        inspection_header = QHBoxLayout()
+        self.inspection_toggle = QToolButton()
+        self.inspection_toggle.setText("Inspection")
+        self.inspection_toggle.setCheckable(True)
+        self.inspection_toggle.setChecked(True)
+        self.inspection_toggle.setArrowType(Qt.DownArrow)
+        self.inspection_toggle.toggled.connect(self.toggle_inspection)
+        inspection_header.addWidget(self.inspection_toggle)
+        inspection_header.addStretch()
+        self.clear_highlights_button = QPushButton("Clear Highlights")
+        self.clear_highlights_button.clicked.connect(self.clear_inspection)
+        inspection_header.addWidget(self.clear_highlights_button)
+        layout.addLayout(inspection_header)
+
+        self.inspection_tabs = QTabWidget()
         self.search_results = QTextEdit()
         self.search_results.setReadOnly(True)
-        layout.addWidget(QLabel("Search Results:"))
-        layout.addWidget(self.search_results)
+        self.bad_pattern_results = QTextEdit()
+        self.bad_pattern_results.setReadOnly(True)
+        self.inspection_tabs.addTab(self.search_results, "Search")
+        self.inspection_tabs.addTab(self.bad_pattern_results, "Bad Patterns")
+        self.inspection_tabs.setMaximumHeight(180)
+        layout.addWidget(self.inspection_tabs)
 
         # Info display
         self.info_display = QLabel()
         self.info_display.setWordWrap(True)
+        self.info_display.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.info_display)
+
+        self.copy_error_button = QPushButton("Copy Error")
+        self.copy_error_button.clicked.connect(self.copy_error)
+        self.copy_error_button.hide()
+        layout.addWidget(self.copy_error_button)
 
         self.setLayout(layout)
 
@@ -387,14 +562,15 @@ class AssemblerWidget(QWidget):
         self.show_bytecodes.stateChanged.connect(self.update_output)
         self.show_instructions.stateChanged.connect(self.update_output)
         self.base_address_input.textChanged.connect(self.update_output)
+        self.bad_pattern_preset.currentIndexChanged.connect(self.apply_bad_pattern_preset)
+        self.asm_input.cursorPositionChanged.connect(self.highlight_source_output)
+        self.output.cursorPositionChanged.connect(self.select_source_for_output)
 
     def toggle_mnemonic_options(self, index):
         if self.format_combo.itemText(index) == "Mnemonics":
             self.mnemonic_options.show()
-            self.base_address_widget.show()
         else:
             self.mnemonic_options.hide()
-            self.base_address_widget.hide()
         self.update_output()
 
     def update_output(self):
@@ -402,16 +578,29 @@ class AssemblerWidget(QWidget):
         self.clear_highlighting()
 
     def clear_highlighting(self):
-        cursor = self.output.textCursor()
-        cursor.beginEditBlock()
-        cursor.select(QTextCursor.Document)
-        cursor.setCharFormat(QTextCharFormat())
-        cursor.clearSelection()
-        cursor.endEditBlock()
-        self.output.setTextCursor(cursor)
+        self.bad_byte_ranges = []
+        self.search_byte_ranges = []
+        self.selected_byte_ranges = []
+        self.refresh_highlighting()
+
+    def clear_inspection(self):
+        self.clear_highlighting()
+        self.search_results.clear()
+        self.bad_pattern_results.clear()
+        self.info_display.setText("")
+
+    def toggle_inspection(self, visible: bool):
+        self.inspection_toggle.setArrowType(
+            Qt.DownArrow if visible else Qt.RightArrow
+        )
+        self.clear_highlights_button.setVisible(visible)
+        self.inspection_tabs.setVisible(visible)
 
     def copy_output(self):
-        output_text = self.output.toPlainText()
+        output_text = self.output.textCursor().selectedText()
+        if not output_text:
+            output_text = self.output.toPlainText()
+        output_text = output_text.replace("\u2029", "\n")
         QApplication.clipboard().setText(output_text)
 
         # Visual feedback
@@ -424,82 +613,78 @@ class AssemblerWidget(QWidget):
 
         self.info_display.setText("Output copied to clipboard")
 
+    def copy_format(self, output_format: str):
+        if self.result is None:
+            self.show_inline_error("Run a successful assembly or disassembly first")
+            return
+
+        QApplication.clipboard().setText(
+            self.assembler.format_output(
+                self.result, output_format, self.mnemonic_options_values()
+            )
+        )
+        self.info_display.setText(f"{output_format} output copied to clipboard")
+
     def reset_copy_button(self, original_text):
         self.copy_button.setText(original_text)
         self.copy_button.setEnabled(True)
 
+    def mnemonic_options_values(self) -> Dict:
+        return {
+            "show_addresses": self.show_addresses.isChecked(),
+            "show_bytecodes": self.show_bytecodes.isChecked(),
+            "show_instructions": self.show_instructions.isChecked(),
+            "base_address": int(self.base_address_input.text(), 16),
+        }
+
     def assemble(self) -> None:
-        current_info = self.info_display.text()
         arch_name = self.arch_combo.currentText()
+        input_mode = self.input_mode_combo.currentText()
         output_format = self.format_combo.currentText()
+        self.result = None
 
         try:
-            self.assembler.set_architecture(arch_name)
             input_text = self.asm_input.toPlainText()
 
-            # Determine if input is assembly or raw bytes
-            if all(
-                all(c in "0123456789ABCDEFabcdef \\x\"'" for c in line.strip())
-                for line in input_text.split("\n")
-                if line.strip() and not line.strip().startswith(tuple(COMMENT_CHARS))
-            ):
-                # Raw bytes input
-                processed_input = bytearray()
-                for line in input_text.split("\n"):
-                    line = line.strip()
-                    if line.startswith(tuple(COMMENT_CHARS)):
-                        continue
-                    if line:
-                        if line.startswith('"') and line.endswith('"'):
-                            processed_input.extend(
-                                bytes.fromhex(line.strip('"').replace("\\x", ""))
-                            )
-                        else:
-                            processed_input.extend(bytes.fromhex(line.replace(" ", "")))
-                assembled_instructions = self.assembler.disassemble(processed_input)
-            else:
-                # Assembly input
-                assembled_instructions = self.assembler.assemble(input_text)
-
-            total_bytes = sum(
-                len(instr["bytes"])
-                for instr in assembled_instructions
-                if instr["type"] == "instruction"
+            mnemonic_options = self.mnemonic_options_values()
+            result, formatted_output = self.workflow.run(
+                arch_name, input_text, input_mode, output_format, mnemonic_options
             )
 
-            mnemonic_options = {
-                "show_addresses": self.show_addresses.isChecked(),
-                "show_bytecodes": self.show_bytecodes.isChecked(),
-                "show_instructions": self.show_instructions.isChecked(),
-                "base_address": int(self.base_address_input.text(), 16),
-            }
-            formatted_output = self.assembler.format_output(
-                assembled_instructions, output_format, total_bytes, mnemonic_options
-            )
-
+            self.result = result
             self.output.setPlainText(formatted_output)
             self.clear_highlighting()
-            self.length_value.setText(f"{total_bytes} bytes")
+            self.length_value.setText(f"{result.total_bytes} bytes")
+            self.info_display.setStyleSheet("")
+            self.copy_error_button.hide()
+            if self.bad_chars_input.text().strip():
+                self.check_bad_patterns()
+            else:
+                self.info_display.setText("")
 
-        except (AssemblerError, DisassemblerError) as e:
-            self.show_error(str(e))
-        finally:
-            self.info_display.setText(current_info)
+        except (AssemblerError, DisassemblerError, ValueError) as e:
+            self.show_inline_error(str(e))
 
     def search_pattern(self):
         pattern = self.search_input.text()
         respect_boundaries = self.byte_boundary_checkbox.isChecked()
-        assembled_text = self.output.toPlainText()
+
+        if self.result is None:
+            self.show_error("Run a successful assembly or disassembly first")
+            return
 
         try:
-            # Extract raw bytes
-            assembled_bytes = self.get_raw_bytes(assembled_text)
-
             matches = self.assembler.search_pattern(
-                assembled_bytes, pattern, respect_boundaries
+                self.result.raw_bytes, pattern, respect_boundaries
             )
+            self.search_byte_ranges = [
+                (match["offset"], match["length"]) for match in matches
+            ]
+            self.refresh_highlighting()
 
             self.search_results.clear()
+            self.inspection_toggle.setChecked(True)
+            self.inspection_tabs.setCurrentWidget(self.search_results)
             if matches:
                 for match in matches:
                     self.search_results.append(
@@ -515,108 +700,174 @@ class AssemblerWidget(QWidget):
 
     def check_bad_patterns(self):
         bad_patterns_input = self.bad_chars_input.text().strip()
-        assembled_text = self.output.toPlainText()
         respect_instructions = self.instruction_size_checkbox.isChecked()
+
+        if self.result is None:
+            self.show_error("Run a successful assembly or disassembly first")
+            return
 
         try:
             bad_patterns = [
                 bytes.fromhex(pattern.replace(" ", ""))
                 for pattern in bad_patterns_input.split()
             ]
-            assembled_bytes = self.get_raw_bytes(assembled_text)
-
             found_bad_patterns = self.assembler.check_bad_patterns(
-                assembled_bytes, bad_patterns, respect_instructions
+                self.result, bad_patterns, respect_instructions
             )
 
-            self.search_results.clear()
+            self.bad_pattern_results.clear()
+            self.inspection_toggle.setChecked(True)
+            self.inspection_tabs.setCurrentWidget(self.bad_pattern_results)
             if found_bad_patterns:
-                self.search_results.append("Bad patterns found:")
+                self.bad_pattern_results.append("Bad patterns found:")
                 for result in found_bad_patterns:
-                    self.search_results.append(
+                    self.bad_pattern_results.append(
                         f"Offset {result['offset']}: {result['pattern']}"
                     )
                 self.info_display.setText(
                     f"Found {len(found_bad_patterns)} bad pattern(s)."
                 )
             else:
-                self.search_results.append("No bad patterns found.")
+                self.bad_pattern_results.append("No bad patterns found.")
                 self.info_display.setText("No bad patterns found.")
 
-            # Highlight bad patterns in the output
-            self.highlight_bad_patterns(assembled_text, found_bad_patterns)
+            self.bad_byte_ranges = [
+                (result["offset"], len(bytes.fromhex(result["pattern"])))
+                for result in found_bad_patterns
+            ]
+            self.refresh_highlighting()
 
         except ValueError as e:
             self.show_error(
                 f"Invalid input. Use hex format (e.g., 00 0a 0d d287). Error: {str(e)}"
             )
 
-    def get_raw_bytes(self, assembled_text: str) -> bytes:
-        if "\\x" in assembled_text:  # Inline format
-            return bytes.fromhex(assembled_text.replace('"', "").replace("\\x", ""))
-        elif "shellcode = [" in assembled_text:  # Python format
-            hex_values = re.findall(r'b"([0-9a-fA-F]+)"', assembled_text)
-            return b"".join(bytes.fromhex(value) for value in hex_values)
-        elif "0x" in assembled_text:  # C-Array format
-            hex_values = re.findall(r"0x([0-9a-fA-F]{2})", assembled_text)
-            return bytes.fromhex("".join(hex_values))
-        else:  # Hex format
-            return bytes.fromhex(re.sub(r"\s", "", assembled_text))
+    def apply_bad_pattern_preset(self, index: int):
+        pattern = self.bad_pattern_preset.itemData(index)
+        if pattern is None:
+            return
+        self.bad_chars_input.setText(pattern)
+        if self.result is not None:
+            self.check_bad_patterns()
 
-    def highlight_bad_patterns(
-        self, assembled_text: str, found_bad_patterns: List[Dict]
-    ):
-        cursor = self.output.textCursor()
-        cursor.beginEditBlock()
+    def output_byte_positions(self) -> List[tuple]:
+        output_text = self.output.toPlainText()
+        output_format = self.format_combo.currentText()
 
-        highlight_format = QTextCharFormat()
-        highlight_format.setBackground(QColor(255, 200, 200))  # Light red background
-        highlight_format.setForeground(QColor(0, 0, 0))  # Black text
-        start = 0
-        length = 0
+        if output_format == "Inline":
+            return [(match.start(), 4) for match in re.finditer(r"\\x[0-9a-fA-F]{2}", output_text)]
+        if output_format == "Python":
+            return [
+                (match.start(1) + index, 2)
+                for match in re.finditer(r'b"([0-9a-fA-F]+)"', output_text)
+                for index in range(0, len(match.group(1)), 2)
+            ]
+        if output_format == "C-Array":
+            return [(match.start(), 4) for match in re.finditer(r"0x[0-9a-fA-F]{2}", output_text)]
+        if output_format == "Hex":
+            return [(match.start(), 2) for match in re.finditer(r"[0-9a-fA-F]{2}", output_text)]
+        if not self.show_bytecodes.isChecked() or self.result is None:
+            return []
 
-        for result in found_bad_patterns:
-            offset, pattern = result["offset"], result["pattern"]
-            pattern_length = len(bytes.fromhex(pattern))
+        positions = []
+        search_start = 0
+        for instruction in self.result.instructions:
+            if instruction["type"] != "instruction":
+                continue
+            bytecode = instruction["bytes"].hex()
+            start = output_text.find(bytecode, search_start)
+            if start < 0:
+                return []
+            positions.extend((start + index, 2) for index in range(0, len(bytecode), 2))
+            search_start = start + len(bytecode)
+        return positions
 
-            if "\\x" in assembled_text:  # Inline format
-                start = assembled_text.index('"') + 1 + offset * 4
-                length = pattern_length * 4
-            elif "shellcode = [" in assembled_text:  # Python format
-                # Find the correct chunk and highlight within it
-                cumulative_length = 0
-                for match in re.finditer(r'b"([0-9a-fA-F]+)"', assembled_text):
-                    chunk_length = len(match.group(1)) // 2
-                    if cumulative_length <= offset < cumulative_length + chunk_length:
-                        relative_offset = offset - cumulative_length
-                        start = match.start() + 2 + relative_offset * 2
-                        length = min(pattern_length, chunk_length - relative_offset) * 2
-                        break
-                    cumulative_length += chunk_length
-            elif "0x" in assembled_text:  # C-Array format
-                hex_positions = [
-                    m.start() for m in re.finditer(r"0x[0-9a-fA-F]{2}", assembled_text)
+    def refresh_highlighting(self):
+        positions = self.output_byte_positions()
+        if not positions:
+            self.output.setExtraSelections([])
+            return
+
+        selections = []
+        for ranges, color in (
+            (self.bad_byte_ranges, QColor(185, 28, 28)),
+            (self.search_byte_ranges, QColor(15, 118, 110)),
+            (self.selected_byte_ranges, QColor(30, 64, 175)),
+        ):
+            for offset, length in ranges:
+                for start, width in positions[offset : offset + length]:
+                    cursor = self.output.textCursor()
+                    cursor.setPosition(start)
+                    cursor.movePosition(
+                        QTextCursor.Right, QTextCursor.KeepAnchor, width
+                    )
+                    selection = QTextEdit.ExtraSelection()
+                    selection.cursor = cursor
+                    selection.format.setBackground(color)
+                    selection.format.setForeground(QColor(255, 255, 255))
+                    selections.append(selection)
+        self.output.setExtraSelections(selections)
+
+    def highlight_source_output(self):
+        if self._syncing_selection or self.result is None:
+            return
+
+        cursor = self.asm_input.textCursor()
+        start_line = self.asm_input.document().findBlock(
+            cursor.selectionStart()
+        ).blockNumber() + 1
+        selection_end = cursor.selectionEnd()
+        if selection_end > cursor.selectionStart():
+            selection_end -= 1
+        end_line = self.asm_input.document().findBlock(selection_end).blockNumber() + 1
+        self.selected_byte_ranges = [
+            byte_range
+            for source_line in range(start_line, end_line + 1)
+            if (byte_range := self.result.byte_range_for_source_line(source_line))
+            is not None
+        ]
+        self.refresh_highlighting()
+
+    def select_source_for_output(self):
+        if self._syncing_selection or self.result is None:
+            return
+
+        output_position = self.output.textCursor().position()
+        for offset, (start, length) in enumerate(self.output_byte_positions()):
+            if start <= output_position < start + length:
+                source_line = self.result.source_line_at_offset(offset)
+                if source_line is None:
+                    return
+                self._syncing_selection = True
+                cursor = QTextCursor(
+                    self.asm_input.document().findBlockByNumber(source_line - 1)
+                )
+                cursor.movePosition(QTextCursor.StartOfBlock)
+                cursor.movePosition(
+                    QTextCursor.EndOfBlock, QTextCursor.KeepAnchor
+                )
+                self.asm_input.setTextCursor(cursor)
+                self.asm_input.ensureCursorVisible()
+                self._syncing_selection = False
+                self.selected_byte_ranges = [
+                    self.result.byte_range_for_source_line(source_line)
                 ]
-                start = hex_positions[offset]
-                length = pattern_length * 4
-            else:  # Hex format
-                start = offset * 3
-                length = pattern_length * 3 - 1
-
-            if not start:
-                self.show_error("Could not find the start position for highlighting")
-            if not length:
-                self.show_error("Could not find the length for highlighting")
-            cursor.setPosition(start)
-            cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, length)
-            cursor.mergeCharFormat(highlight_format)
-
-        cursor.endEditBlock()
-        self.output.setTextCursor(cursor)
+                self.refresh_highlighting()
+                return
 
     def show_error(self, message: str):
         QMessageBox.critical(self, "Error", message)
         self.search_results.setPlainText(f"Error: {message}")
+
+    def show_inline_error(self, message: str):
+        self.info_display.setStyleSheet("color: #b00020;")
+        self.info_display.setText(message)
+        self.copy_error_button.show()
+
+    def copy_error(self):
+        QApplication.clipboard().setText(self.info_display.text())
+        self.copy_error_button.setText("Copied")
+        QTimer.singleShot(1500, lambda: self.copy_error_button.setText("Copy Error"))
 
 
 assembler_widget = None

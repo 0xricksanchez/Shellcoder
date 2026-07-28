@@ -1,0 +1,13 @@
+[project]
+name = "shellcoder"
+version = "1.1.0"
+description = "Interactive shellcode assembler and disassembler for Binary Ninja"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = []
